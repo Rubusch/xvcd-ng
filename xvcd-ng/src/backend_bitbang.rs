@@ -1,3 +1,4 @@
+use crate::xvc_server::JtagController;
 use libftdi1_sys::{
     ftdi_context, ftdi_free, ftdi_new, ftdi_set_bitmode, ftdi_usb_close, 
     ftdi_usb_open, ftdi_write_data, ftdi_read_data
@@ -7,11 +8,6 @@ const TCK_PIN: u8  = 0x01; // Output (Bit 0)
 const TDI_PIN: u8  = 0x02; // Output (Bit 1)
 const TDO_PIN: u8  = 0x04; // Input  (Bit 2)
 const TMS_PIN: u8  = 0x08; // Output (Bit 3)
-
-pub trait JtagController {
-    fn set_tck_period(&mut self, period_ns: u32) -> u32;
-    fn shift(&mut self, bits: u32, tms: &[u8], tdi: &[u8], tdo: &mut [u8]);
-}
 
 pub struct FtdiBitbangBackend {
     ctx: *mut ftdi_context,
@@ -34,7 +30,7 @@ impl FtdiBitbangBackend {
             // Configure Pins: TCK, TDI, TMS as output (1), TDO as input (0)
             // Mask: 0x01 | 0x02 | 0x08 = 0x0B. Mode: 0x01 (Asynchronous BitBang)
             let direction_mask = TCK_PIN | TDI_PIN | TMS_PIN;
-            let ret = ftdi_set_bitmode(ctx, direction_mask, 0x01);
+            let ret = ftdi_set_bitmode(ctx, direction_mask, 0x01); // 0x01 = Async Bitbang
             if ret < 0 {
                 ftdi_usb_close(ctx);
                 ftdi_free(ctx);
@@ -65,6 +61,8 @@ impl JtagController for FtdiBitbangBackend {
 
     fn shift(&mut self, bits: u32, tms: &[u8], tdi: &[u8], tdo: &mut [u8]) {
         unsafe {
+            for byte in tdo.iter_mut() { *byte = 0x00; }
+
             for i in 0..bits {
                 let byte_idx = (i / 8) as usize;
                 let bit_idx = (i % 8) as u8;
