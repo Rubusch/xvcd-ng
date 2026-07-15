@@ -20,6 +20,10 @@ pub struct CliArgs {
 
     #[arg(short, long, value_enum, default_value_t = BackendMode::Bitbang)]
     pub mode: BackendMode,
+
+    /// Hardware channel port selection index (0 = Channel A, 1 = Channel B, etc.)
+    #[arg(short, long, default_value = "0")]
+    pub channel: u8,
 }
 
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
@@ -41,6 +45,7 @@ mod tests {
         assert_eq!(config.vid, 0x0403);
         assert_eq!(config.pid, 0x6010);
         assert_eq!(config.mode, BackendMode::Bitbang);
+        assert_eq!(config.channel, 0); // Validate default fallback value matches
     }
 
     #[test]
@@ -50,7 +55,8 @@ mod tests {
             "--port", "3000",
             "--vid", "0xabcd",
             "--pid", "1234",
-            "--mode", "mpsse"
+            "--mode", "mpsse",
+            "--channel", "1"
         ]);
         assert!(args.is_ok());
 
@@ -59,6 +65,7 @@ mod tests {
         assert_eq!(config.vid, 0xabcd);
         assert_eq!(config.pid, 0x1234);
         assert_eq!(config.mode, BackendMode::Mpsse);
+        assert_eq!(config.channel, 1);
     }
 
     #[test]
@@ -68,7 +75,8 @@ mod tests {
             "-P", "3000",
             "-v", "0xabcd",
             "-p", "1234",
-            "-m", "mpsse"
+            "-m", "mpsse",
+            "-c", "1"
         ]);
         assert!(args.is_ok());
 
@@ -77,11 +85,12 @@ mod tests {
         assert_eq!(config.vid, 0xabcd);
         assert_eq!(config.pid, 0x1234);
         assert_eq!(config.mode, BackendMode::Mpsse);
+        assert_eq!(config.channel, 1);
     }
 
     #[test]
     fn test_cli_invalid_hex_rejection() {
         let args = CliArgs::try_parse_from(["xvcd-ng", "--vid", "invalid_hex_string"]);
-        assert!(args.is_err()); // Ensure clap rejects malformed hex inputs gracefully
+        assert!(args.is_err()); 
     }
 }

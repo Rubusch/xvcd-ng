@@ -7,18 +7,42 @@ pub struct FtdiMpsseBackend {
 }
 
 impl FtdiMpsseBackend {
-    pub fn new(vid: u16, pid: u16) -> Result<Self, String> {
+    pub fn new(vid: u16, pid: u16, channel_index: u8) -> Result<Self, String> {
         let context = Context::new().map_err(|e| format!("USB Context init fail: {}", e))?;
-        let handle = context.open_device_with_vid_pid(vid, pid)
-            .ok_or_else(|| format!("Could not find device with VID: {:04x} PID: {:04x}", vid, pid))?;
+        let device = context.devices().map_err(|e| format!("Failed to list USB devices: {}", e))?
+            .iter()
+            .find(|d| {
+                if let Ok(desc) = d.device_descriptor() {
+                    desc.vendor_id() == vid && desc.product_id() == pid
+                } else {
+                    false
+                }
+            })
+            .ok_or_else(|| format!("Could not locate physical device matching VID: {:04x} PID: {:04x}", vid, pid))?;
 
-        let interface = 0u8;
+        let desc = device.device_descriptor().map_err(|e| format!("Descriptor fault: {}", e))?;
+        
+        let bcd_device = desc.device_version();
+        let major = bcd_device.major();
+        let minor = bcd_device.minor();
+
+        match (major, minor) {
+            (7, 0) | (8, 0) => println!("Silicon Profile Identified: FT2232H Series (Dual Engine)"),
+            (9, 0) => println!("Silicon Profile Identified: FT4232H Series (Quad Engine)"),
+            _ => println!("Silicon Profile Identified: Alternative FTDI Family (BCD Version: {}.{})", major, minor),
+        }
+
+        let handle = device.open().map_err(|e| format!("Failed to open device: {}", e))?;
+        let interface = channel_index;
         let _ = handle.detach_kernel_driver(interface);
-        handle.claim_interface(interface).map_err(|e| format!("Interface claim failed: {}", e))?;
+        
+        handle.claim_interface(interface)
+            .map_err(|e| format!("Interface claim failed: {}", e))?;
 
-        let value = (0x02u16 << 8) | 0x0B_u16;
-        handle.write_control(0x40, 0x0B, value, (interface + 1) as u16, &[], Duration::from_millis(100))
-            .map_err(|e| format!("Failed to set MPSSE mode: {}", e))?;
+        let index_routing_value = (interface as u16) + 1;
+        let value = (0x02u16 << 8) | 0x0B_u16; 
+        handle.write_control(0x40, 0x0B, value, index_routing_value, &[], Duration::from_millis(100))
+            .map_err(|e| format!("Failed to establish target MPSSE engine: {}", e))?;
 
         let mut backend = FtdiMpsseBackend { handle };
         backend.set_tck_period(500);

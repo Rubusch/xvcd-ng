@@ -16,20 +16,22 @@ pub struct FtdiBitbangBackend {
 }
 
 impl FtdiBitbangBackend {
-    pub fn new(vid: u16, pid: u16) -> Result<Self, String> {
+    pub fn new(vid: u16, pid: u16, channel_index: u8) -> Result<Self, String> {
         let context = Context::new().map_err(|e| format!("USB Context init fail: {}", e))?;
         let handle = context.open_device_with_vid_pid(vid, pid)
             .ok_or_else(|| format!("Could not find device with VID: {:04x} PID: {:04x}", vid, pid))?;
 
-        let interface = 0u8;
+        let interface = channel_index;
         let _ = handle.detach_kernel_driver(interface);
-        handle.claim_interface(interface).map_err(|e| format!("Interface claim failed: {}", e))?;
+        handle.claim_interface(interface)
+            .map_err(|e| format!("Interface claim failed: {}", e))?;
+        let index_routing_value = (interface as u16) + 1;
 
         // Configure Bitbang execution layer: Mask 0x0B, Mode 0x01 (Async Bitbang)
         let value = (0x01u16 << 8) | (TCK_PIN | TDI_PIN | TMS_PIN) as u16;
-        handle.write_control(0x40, REQ_SET_BITMODE, value, (interface + 1) as u16, &[], Duration::from_millis(100))
+        handle.write_control(0x40, REQ_SET_BITMODE, value, index_routing_value, &[], Duration::from_millis(100))
             .map_err(|e| format!("Failed to set Bitbang Mode: {}", e))?;
-
+        
         Ok(FtdiBitbangBackend { handle, interface })
     }
 }
