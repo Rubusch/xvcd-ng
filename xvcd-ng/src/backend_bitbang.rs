@@ -1,92 +1,68 @@
 use crate::xvc_server::JtagController;
-use libftdi1_sys::{
-    ftdi_context, ftdi_free, ftdi_new, ftdi_set_bitmode, ftdi_usb_close, 
-    ftdi_usb_open, ftdi_write_data, ftdi_read_data
-};
+use rusb::{Context, DeviceHandle, UsbContext};
+use std::time::Duration;
 
 const TCK_PIN: u8  = 0x01; // Output (Bit 0)
 const TDI_PIN: u8  = 0x02; // Output (Bit 1)
 const TDO_PIN: u8  = 0x04; // Input  (Bit 2)
 const TMS_PIN: u8  = 0x08; // Output (Bit 3)
 
+const REQ_SET_BITMODE: u8 = 0x0B;
+const REQ_READ_PINS: u8   = 0x0C;
+
 pub struct FtdiBitbangBackend {
-    ctx: *mut ftdi_context,
+    handle: DeviceHandle<Context>,
+    interface: u8,
 }
 
 impl FtdiBitbangBackend {
     pub fn new(vid: u16, pid: u16) -> Result<Self, String> {
-        unsafe {
-            let ctx = ftdi_new();
-            if ctx.is_null() {
-                return Err("Failed to allocate FTDI context context".to_string());
-            }
+        let context = Context::new().map_err(|e| format!("USB Context init fail: {}", e))?;
+        let handle = context.open_device_with_vid_pid(vid, pid)
+            .ok_or_else(|| format!("Could not find device with VID: {:04x} PID: {:04x}", vid, pid))?;
 
-            let ret = ftdi_usb_open(ctx, vid as i32, pid as i32);
-            if ret < 0 {
-                ftdi_free(ctx);
-                return Err(format!("Failed to open FTDI device: {}", ret));
-            }
+        let interface = 0u8;
+        let _ = handle.detach_kernel_driver(interface);
+        handle.claim_interface(interface).map_err(|e| format!("Interface claim failed: {}", e))?;
 
-            // Configure Pins: TCK, TDI, TMS as output (1), TDO as input (0)
-            // Mask: 0x01 | 0x02 | 0x08 = 0x0B. Mode: 0x01 (Asynchronous BitBang)
-            let direction_mask = TCK_PIN | TDI_PIN | TMS_PIN;
-            let ret = ftdi_set_bitmode(ctx, direction_mask, 0x01); // 0x01 = Async Bitbang
-            if ret < 0 {
-                ftdi_usb_close(ctx);
-                ftdi_free(ctx);
-                return Err(format!("Failed to set bitbang mode: {}", ret));
-            }
+        // Configure Bitbang execution layer: Mask 0x0B, Mode 0x01 (Async Bitbang)
+        let value = (0x01u16 << 8) | (TCK_PIN | TDI_PIN | TMS_PIN) as u16;
+        handle.write_control(0x40, REQ_SET_BITMODE, value, (interface + 1) as u16, &[], Duration::from_millis(100))
+            .map_err(|e| format!("Failed to set Bitbang Mode: {}", e))?;
 
-            Ok(FtdiBitbangBackend { ctx })
-        }
-    }
-}
-
-impl Drop for FtdiBitbangBackend {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.ctx.is_null() {
-                ftdi_usb_close(self.ctx);
-                ftdi_free(self.ctx);
-            }
-        }
+        Ok(FtdiBitbangBackend { handle, interface })
     }
 }
 
 impl JtagController for FtdiBitbangBackend {
-    fn set_tck_period(&mut self, period_ns: u32) -> u32 {
-        // Bitbang clock speeds are strictly bounded by raw USB framing latency limits
-        period_ns 
-    }
+    fn set_tck_period(&mut self, period_ns: u32) -> u32 { period_ns }
 
     fn shift(&mut self, bits: u32, tms: &[u8], tdi: &[u8], tdo: &mut [u8]) {
-        unsafe {
-            for byte in tdo.iter_mut() { *byte = 0x00; }
+        for byte in tdo.iter_mut() { *byte = 0x00; }
 
-            for i in 0..bits {
-                let byte_idx = (i / 8) as usize;
-                let bit_idx = (i % 8) as u8;
+        for i in 0..bits {
+            let byte_idx = (i / 8) as usize;
+            let bit_idx = (i % 8) as u8;
 
-                let tms_val = (tms[byte_idx] >> bit_idx) & 1;
-                let tdi_val = (tdi[byte_idx] >> bit_idx) & 1;
+            let tms_val = (tms[byte_idx] >> bit_idx) & 1;
+            let tdi_val = (tdi[byte_idx] >> bit_idx) & 1;
 
-                let mut pin_state = 0x00;
-                if tms_val > 0 { pin_state |= TMS_PIN; }
-                if tdi_val > 0 { pin_state |= TDI_PIN; }
-                
-                let mut buf = [pin_state];
-                ftdi_write_data(self.ctx, buf.as_mut_ptr(), 1);
+            let mut pin_state = 0x00;
+            if tms_val > 0 { pin_state |= TMS_PIN; }
+            if tdi_val > 0 { pin_state |= TDI_PIN; }
 
-                pin_state |= TCK_PIN;
-                buf = [pin_state];
-                ftdi_write_data(self.ctx, buf.as_mut_ptr(), 1);
+            let mut buf = [pin_state];
+            let _ = self.handle.write_bulk(0x02, &buf, Duration::from_millis(10));
 
-                let mut read_buf = [0u8];
-                ftdi_read_data(self.ctx, read_buf.as_mut_ptr(), 1);
-                let tdo_val = if (read_buf[0] & TDO_PIN) > 0 { 1u8 } else { 0u8 };
+            pin_state |= TCK_PIN;
+            buf = [pin_state];
+            let _ = self.handle.write_bulk(0x02, &buf, Duration::from_millis(10));
 
-                tdo[byte_idx] |= tdo_val << bit_idx;
-            }
+            let mut read_buf = [0u8; 1];
+            let _ = self.handle.read_control(0xC0, REQ_READ_PINS, 0, (self.interface + 1) as u16, &mut read_buf, Duration::from_millis(10));
+
+            let tdo_val = if (read_buf[0] & TDO_PIN) > 0 { 1u8 } else { 0u8 };
+            tdo[byte_idx] |= tdo_val << bit_idx;
         }
     }
 }

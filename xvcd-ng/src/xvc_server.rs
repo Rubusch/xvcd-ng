@@ -8,48 +8,46 @@ pub trait JtagController {
     fn shift(&mut self, bits: u32, tms: &[u8], tdi: &[u8], tdo: &mut [u8]);
 }
 
-pub fn process_xvc_stream<T: JtagController, S: Read + Write>(
-    mut stream: S, 
+pub fn process_xvc_stream<T: JtagController + ?Sized, S: Read + Write>(
+    mut stream: S,
     hardware: &mut T
 ) -> std::io::Result<()> {
     let mut buffer = [0u8; 8];
 
     loop {
         if stream.read_exact(&mut buffer).is_err() {
-            break; 
+            break;
         }
 
         if &buffer[0..8] == b"getinfo:" {
             stream.write_all(XVC_INFO_STRING)?;
             stream.flush()?;
+
         } else if &buffer[0..8] == b"settck:" {
             let mut period_buf = [0u8; 4];
             stream.read_exact(&mut period_buf)?;
+
             let requested_ns = (&period_buf[..]).read_u32::<LittleEndian>()?;
-            
             let configured_ns = hardware.set_tck_period(requested_ns);
-            
             let mut reply = [0u8; 4];
+
             (&mut reply[..]).write_u32::<LittleEndian>(configured_ns)?;
             stream.write_all(&reply)?;
             stream.flush()?;
+
         } else if &buffer[0..6] == b"shift:" {
             let b0 = buffer[6] as u32;
             let b1 = buffer[7] as u32;
             let b2 = stream.read_u16::<LittleEndian>()? as u32;
-            
             let num_bits = b0 | (b1 << 8) | (b2 << 16);
             let byte_len = ((num_bits + 7) / 8) as usize;
-            
             let mut tms_bytes = vec![0u8; byte_len];
             let mut tdi_bytes = vec![0u8; byte_len];
             let mut tdo_bytes = vec![0u8; byte_len];
 
             stream.read_exact(&mut tms_bytes)?;
             stream.read_exact(&mut tdi_bytes)?;
-
             hardware.shift(num_bits, &tms_bytes, &tdi_bytes, &mut tdo_bytes);
-
             stream.write_all(&tdo_bytes)?;
             stream.flush()?;
         } else {
