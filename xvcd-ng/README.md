@@ -17,8 +17,17 @@ Hardware Configuration: FT2232H
 ## Crosscompiling
 
 ### rusb
+Prepare for crosscompiling
+```
+$ mkdir .cargo
+$ vi .cargo/config.toml
+    [target.aarch64-unknown-linux-gnu]
+    linker = "aarch64-linux-gnu-gcc"
+```
+
 Build for RPi4 (aarch64)
 ```
 $ cargo build --target aarch64-unknown-linux-gnu --release
 ```
+
 Find the binary here: `./target/aarch64-unknown-linux-gnu/release/xvcd-ng`
