@@ -91,6 +91,6 @@ mod tests {
     #[test]
     fn test_cli_invalid_hex_rejection() {
         let args = CliArgs::try_parse_from(["xvcd-ng", "--vid", "invalid_hex_string"]);
-        assert!(args.is_err()); 
+        assert!(args.is_err());
     }
 }

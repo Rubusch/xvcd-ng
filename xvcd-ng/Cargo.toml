@@ -8,4 +8,4 @@ byteorder = "1.5.0"
 clap = { version = "4.6.1", features = ["derive"] }
 env_logger = "0.11.11"
 log = "0.4.33"
-rusb = "0.9.4"
+nusb = "0.2.5"

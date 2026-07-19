@@ -1,5 +1,6 @@
 use crate::xvc_server::JtagController;
-use rusb::{Context, DeviceHandle, UsbContext};
+use nusb::MaybeFuture;
+use nusb::transfer::{ControlOut, ControlType, Recipient, Bulk, In, Out, Buffer};
 use std::time::Duration;
 
 const TCK_PIN: u8  = 0x01; // Output (Bit 0)
@@ -7,32 +8,69 @@ const TDI_PIN: u8  = 0x02; // Output (Bit 1)
 const TDO_PIN: u8  = 0x04; // Input  (Bit 2)
 const TMS_PIN: u8  = 0x08; // Output (Bit 3)
 
-const REQ_SET_BITMODE: u8 = 0x0B;
-const REQ_READ_PINS: u8   = 0x0C;
-
 pub struct FtdiBitbangBackend {
-    handle: DeviceHandle<Context>,
-    interface: u8,
+    _interface_handle: nusb::Interface,
+    out_endpoint: nusb::Endpoint<Bulk, Out>,
+    in_endpoint: nusb::Endpoint<Bulk, In>,
 }
 
 impl FtdiBitbangBackend {
     pub fn new(vid: u16, pid: u16, channel_index: u8) -> Result<Self, String> {
-        let context = Context::new().map_err(|e| format!("USB Context init fail: {}", e))?;
-        let handle = context.open_device_with_vid_pid(vid, pid)
-            .ok_or_else(|| format!("Could not find device with VID: {:04x} PID: {:04x}", vid, pid))?;
+        let mut devices = nusb::list_devices()
+            .wait()
+            .map_err(|e| format!("Failed listing USB layout: {}", e))?;
 
-        let interface = channel_index;
-        let _ = handle.detach_kernel_driver(interface);
-        handle.claim_interface(interface)
-            .map_err(|e| format!("Interface claim failed: {}", e))?;
-        let index_routing_value = (interface as u16) + 1;
+        let info = devices
+            .find(|d| d.vendor_id() == vid && d.product_id() == pid)
+            .ok_or_else(|| format!("Could not locate device with VID: {:04x} PID: {:04x}", vid, pid))?;
 
-        // Configure Bitbang execution layer: Mask 0x0B, Mode 0x01 (Async Bitbang)
-        let value = (0x01u16 << 8) | (TCK_PIN | TDI_PIN | TMS_PIN) as u16;
-        handle.write_control(0x40, REQ_SET_BITMODE, value, index_routing_value, &[], Duration::from_millis(100))
-            .map_err(|e| format!("Failed to set Bitbang Mode: {}", e))?;
-        
-        Ok(FtdiBitbangBackend { handle, interface })
+        let device = info.open().wait().map_err(|e| format!("Failed opening device handle: {}", e))?;
+        let interface_handle = device.claim_interface(channel_index)
+            .wait()
+            .map_err(|e| format!("Failed to claim interface {}: {}", channel_index, e))?;
+
+        let out_addr = 0x02 + (channel_index * 2);
+        let in_addr = 0x81 + (channel_index * 2);
+
+        let out_endpoint = interface_handle.endpoint::<Bulk, Out>(out_addr)
+            .map_err(|e| format!("Failed to open OUT endpoint: {}", e))?;
+        let in_endpoint = interface_handle.endpoint::<Bulk, In>(in_addr)
+            .map_err(|e| format!("Failed to open IN endpoint: {}", e))?;
+
+        let index_routing_value = (channel_index as u16) + 1;
+
+        interface_handle.control_out(ControlOut {
+            control_type: ControlType::Vendor,
+            recipient: Recipient::Device,
+            request: 0x00, // FTDI Reset command
+            value: 0,
+            index: index_routing_value,
+            data: &[],
+        }, Duration::from_millis(100))
+        .wait()
+        .map_err(|e| format!("Reset failed: {:?}", e))?;
+
+        // Mode 0x01 maps to Asynchronous Bitbang over standard FTDI chips
+        // High byte: Mode Selection (0x01) | Low byte: Pin Direction Configuration (Mask)
+        let direction_mask = TCK_PIN | TDI_PIN | TMS_PIN;
+        let bitmode_value = (0x01u16 << 8) | (direction_mask as u16);
+
+        interface_handle.control_out(ControlOut {
+            control_type: ControlType::Vendor,
+            recipient: Recipient::Device,
+            request: 0x0B, // SET_BITMODE
+            value: bitmode_value,
+            index: index_routing_value,
+            data: &[],
+        }, Duration::from_millis(100))
+        .wait()
+        .map_err(|e| format!("Failed to set Bitbang Mode: {:?}", e))?;
+
+        Ok(FtdiBitbangBackend {
+            _interface_handle: interface_handle,
+            out_endpoint,
+            in_endpoint
+        })
     }
 }
 
@@ -41,6 +79,12 @@ impl JtagController for FtdiBitbangBackend {
 
     fn shift(&mut self, bits: u32, tms: &[u8], tdi: &[u8], tdo: &mut [u8]) {
         for byte in tdo.iter_mut() { *byte = 0x00; }
+        if bits == 0 { return; }
+
+        // Each bit requires 2 steps (TCK low, TCK high). We batch everything into
+        // a single array buffer to maximize USB high-speed pipeline performance.
+        let num_steps = bits as usize * 2;
+        let mut cmd_buffer = Vec::with_capacity(num_steps);
 
         for i in 0..bits {
             let byte_idx = (i / 8) as usize;
@@ -49,22 +93,66 @@ impl JtagController for FtdiBitbangBackend {
             let tms_val = (tms[byte_idx] >> bit_idx) & 1;
             let tdi_val = (tdi[byte_idx] >> bit_idx) & 1;
 
-            let mut pin_state = 0x00;
-            if tms_val > 0 { pin_state |= TMS_PIN; }
-            if tdi_val > 0 { pin_state |= TDI_PIN; }
+            let mut pin_base = 0x00;
+            if tms_val > 0 { pin_base |= TMS_PIN; }
+            if tdi_val > 0 { pin_base |= TDI_PIN; }
 
-            let mut buf = [pin_state];
-            let _ = self.handle.write_bulk(0x02, &buf, Duration::from_millis(10));
-
-            pin_state |= TCK_PIN;
-            buf = [pin_state];
-            let _ = self.handle.write_bulk(0x02, &buf, Duration::from_millis(10));
-
-            let mut read_buf = [0u8; 1];
-            let _ = self.handle.read_control(0xC0, REQ_READ_PINS, 0, (self.interface + 1) as u16, &mut read_buf, Duration::from_millis(10));
-
-            let tdo_val = if (read_buf[0] & TDO_PIN) > 0 { 1u8 } else { 0u8 };
-            tdo[byte_idx] |= tdo_val << bit_idx;
+            cmd_buffer.push(pin_base);
+            cmd_buffer.push(pin_base | TCK_PIN);
         }
+
+        let tx_buffer = Buffer::from(cmd_buffer);
+        let tx_completion = self.out_endpoint.transfer_blocking(tx_buffer, Duration::from_millis(1000));
+
+        if tx_completion.status.is_ok() {
+            let rx_alloc = Buffer::new(num_steps);
+            let rx_completion = self.in_endpoint.transfer_blocking(rx_alloc, Duration::from_millis(1000));
+
+            if rx_completion.status.is_ok() {
+                for i in 0..bits {
+                    let byte_idx = (i / 8) as usize;
+                    let bit_idx = (i % 8) as u8;
+
+                    let step_offset = (i as usize * 2) + 1;
+                    let sampled_pins = rx_completion.buffer[step_offset];
+
+                    let tdo_val = if (sampled_pins & TDO_PIN) > 0 { 1u8 } else { 0u8 };
+                    tdo[byte_idx] |= tdo_val << bit_idx;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_bitbang_vector_generation_logic() {
+        let bits = 2;
+        let tms = [0x01];
+        let tdi = [0x02];
+        let mut cmd_buffer = Vec::new();
+
+        const TCK_PIN: u8 = 0x01;
+        const TDI_PIN: u8 = 0x02;
+        const TMS_PIN: u8 = 0x08;
+
+        for i in 0..bits {
+            let byte_idx = (i / 8) as usize;
+            let bit_idx = (i % 8) as u8;
+            let tms_val = (tms[byte_idx] >> bit_idx) & 1;
+            let tdi_val = (tdi[byte_idx] >> bit_idx) & 1;
+
+            let mut pin_base = 0x00;
+            if tms_val > 0 { pin_base |= TMS_PIN; }
+            if tdi_val > 0 { pin_base |= TDI_PIN; }
+            cmd_buffer.push(pin_base);
+            cmd_buffer.push(pin_base | TCK_PIN);
+        }
+
+        assert_eq!(cmd_buffer.len(), 4);
+        assert_eq!(cmd_buffer[0], 0x08); // Low clock: TMS=1, TDI=0
+        assert_eq!(cmd_buffer[1], 0x09); // High clock: TCK | TMS
+        assert_eq!(cmd_buffer[2], 0x02); // Low clock: TMS=0, TDI=1
     }
 }

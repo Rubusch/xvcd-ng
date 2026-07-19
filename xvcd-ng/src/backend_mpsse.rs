@@ -1,50 +1,74 @@
 use crate::xvc_server::JtagController;
-use rusb::{Context, DeviceHandle, UsbContext};
+use nusb::MaybeFuture;
+use nusb::transfer::{ControlOut, ControlType, Recipient, Bulk, In, Out, Buffer};
 use std::time::Duration;
 
 pub struct FtdiMpsseBackend {
-    handle: DeviceHandle<Context>,
+    _device_handle: nusb::Interface,
+    out_endpoint: nusb::Endpoint<Bulk, Out>,
+    in_endpoint: nusb::Endpoint<Bulk, In>,
 }
 
 impl FtdiMpsseBackend {
     pub fn new(vid: u16, pid: u16, channel_index: u8) -> Result<Self, String> {
-        let context = Context::new().map_err(|e| format!("USB Context init fail: {}", e))?;
-        let device = context.devices().map_err(|e| format!("Failed to list USB devices: {}", e))?
-            .iter()
-            .find(|d| {
-                if let Ok(desc) = d.device_descriptor() {
-                    desc.vendor_id() == vid && desc.product_id() == pid
-                } else {
-                    false
-                }
-            })
-            .ok_or_else(|| format!("Could not locate physical device matching VID: {:04x} PID: {:04x}", vid, pid))?;
+        let mut devices = nusb::list_devices()
+            .wait()
+            .map_err(|e| format!("Failed listing USB layout: {}", e))?;
 
-        let desc = device.device_descriptor().map_err(|e| format!("Descriptor fault: {}", e))?;
-        
-        let bcd_device = desc.device_version();
-        let major = bcd_device.major();
-        let minor = bcd_device.minor();
+        let info = devices
+            .find(|d| d.vendor_id() == vid && d.product_id() == pid)
+            .ok_or_else(|| format!("Could not locate device with VID: {:04x} PID: {:04x}", vid, pid))?;
 
-        match (major, minor) {
-            (7, 0) | (8, 0) => println!("Silicon Profile Identified: FT2232H Series (Dual Engine)"),
-            (9, 0) => println!("Silicon Profile Identified: FT4232H Series (Quad Engine)"),
-            _ => println!("Silicon Profile Identified: Alternative FTDI Family (BCD Version: {}.{})", major, minor),
-        }
+        let device = info.open().wait().map_err(|e| format!("Failed opening device handle: {}", e))?;
 
-        let handle = device.open().map_err(|e| format!("Failed to open device: {}", e))?;
-        let interface = channel_index;
-        let _ = handle.detach_kernel_driver(interface);
-        
-        handle.claim_interface(interface)
-            .map_err(|e| format!("Interface claim failed: {}", e))?;
+        // Claim the interface corresponding to the selected channel index
+        let interface = device.claim_interface(channel_index)
+            .wait()
+            .map_err(|e| format!("Failed to claim interface {}: {}", channel_index, e))?;
 
-        let index_routing_value = (interface as u16) + 1;
-        let value = (0x02u16 << 8) | 0x0B_u16; 
-        handle.write_control(0x40, 0x0B, value, index_routing_value, &[], Duration::from_millis(100))
-            .map_err(|e| format!("Failed to establish target MPSSE engine: {}", e))?;
+        // Standard FTDI channel endpoints map deterministically:
+        // Channel A -> Out: 0x02, In: 0x81; Channel B -> Out: 0x04, In: 0x83 etc.
+        let out_addr = 0x02 + (channel_index * 2);
+        let in_addr = 0x81 + (channel_index * 2);
 
-        let mut backend = FtdiMpsseBackend { handle };
+        let out_endpoint = interface.endpoint::<Bulk, Out>(out_addr)
+            .map_err(|e| format!("Failed to open OUT endpoint: {}", e))?;
+        let in_endpoint = interface.endpoint::<Bulk, In>(in_addr)
+            .map_err(|e| format!("Failed to open IN endpoint: {}", e))?;
+
+        let index_routing_value = (channel_index as u16) + 1;
+
+        // Reset the interface engine target over control pipe
+        interface.control_out(ControlOut {
+            control_type: ControlType::Vendor,
+            recipient: Recipient::Device,
+            request: 0x00,
+            value: 0,
+            index: index_routing_value,
+            data: &[],
+        }, Duration::from_millis(100))
+        .wait()
+        .map_err(|e| format!("Reset failed: {:?}", e))?;
+
+        // Establish target MPSSE engine: Mode 0x02 (MPSSE)
+        let mpsse_mode_value = (0x02u16 << 8) | 0x0B_u16; // 0x0B = Bitmode request
+        interface.control_out(ControlOut {
+            control_type: ControlType::Vendor,
+            recipient: Recipient::Device,
+            request: 0x0B,
+            value: mpsse_mode_value,
+            index: index_routing_value,
+            data: &[],
+        }, Duration::from_millis(100))
+        .wait()
+        .map_err(|e| format!("MPSSE activation fail: {:?}", e))?;
+
+        let mut backend = FtdiMpsseBackend {
+            _device_handle: interface,
+            out_endpoint,
+            in_endpoint,
+        };
+
         backend.set_tck_period(500);
         Ok(backend)
     }
@@ -58,8 +82,9 @@ impl JtagController for FtdiMpsseBackend {
             if div_val > 0xFFFF { 0xFFFF } else { div_val as u16 }
         };
 
+        // Command 0x86 sets the clock divisor
         let cmd = [0x86u8, (divisor & 0xFF) as u8, ((divisor >> 8) & 0xFF) as u8];
-        let _ = self.handle.write_bulk(0x02, &cmd, Duration::from_millis(10));
+        let _ = self.out_endpoint.transfer_blocking(Buffer::from(cmd.to_vec()), Duration::from_millis(10));
 
         let actual_freq = 30_000_000 / (1 + divisor as u32);
         1_000_000_000 / actual_freq
@@ -67,48 +92,89 @@ impl JtagController for FtdiMpsseBackend {
 
     fn shift(&mut self, bits: u32, tms: &[u8], tdi: &[u8], tdo: &mut [u8]) {
         for byte in tdo.iter_mut() { *byte = 0x00; }
-        let total_bytes = (bits / 8) as usize;
-        let residual_bits = (bits % 8) as u8;
+        if bits == 0 { return; }
 
-        if total_bytes > 0 {
-            let length_arg = (total_bytes - 1) as u16;
-            let header = [0x39u8, (length_arg & 0xFF) as u8, ((length_arg >> 8) & 0xFF) as u8];
-            let _ = self.handle.write_bulk(0x02, &header, Duration::from_millis(10));
+        let mut cmd_buffer = Vec::with_capacity(bits as usize * 3);
+        let mut expected_read_bytes = 0;
 
-            for i in 0..total_bytes {
-                let tms_state = [0x80u8, 0x00, 0x0B];
-                let _ = self.handle.write_bulk(0x02, &tms_state, Duration::from_millis(10));
-                let _ = self.handle.write_bulk(0x02, &[tdi[i]], Duration::from_millis(10));
+        generate_mpsse_payload(bits, tms, tdi, &mut cmd_buffer, &mut expected_read_bytes);
 
-                let mut resp = [0u8; 1];
-                let _ = self.handle.read_bulk(0x81, &mut resp, Duration::from_millis(10));
-                tdo[i] = resp[0];
+        if !cmd_buffer.is_empty() {
+            let tx_buffer = Buffer::from(cmd_buffer);
+            let tx_completion = self.out_endpoint.transfer_blocking(tx_buffer, Duration::from_millis(1000));
+
+            if tx_completion.status.is_ok() {
+                let rx_alloc = Buffer::new(expected_read_bytes);
+                let rx_completion = self.in_endpoint.transfer_blocking(rx_alloc, Duration::from_millis(1000));
+
+                if rx_completion.status.is_ok() {
+                    parse_mpsse_response(bits, &rx_completion.buffer, tdo);
+                }
             }
         }
+    }
+}
 
-        if residual_bits > 0 {
-            let header = [0x3Bu8, residual_bits - 1];
-            let _ = self.handle.write_bulk(0x02, &header, Duration::from_millis(10));
+fn generate_mpsse_payload(bits: u32, tms: &[u8], tdi: &[u8], cmd_buffer: &mut Vec<u8>, expected_read_bytes: &mut usize) {
+    for i in 0..bits {
+        let byte_idx = (i / 8) as usize;
+        let bit_idx = (i % 8) as u8;
 
-            let byte_pos = total_bytes;
-            for b in 0..residual_bits {
-                let tms_val = (tms[byte_pos] >> b) & 1;
-                let tdi_val = (tdi[byte_pos] >> b) & 1;
+        let tms_val = (tms[byte_idx] >> bit_idx) & 1;
+        let tdi_val = (tdi[byte_idx] >> bit_idx) & 1;
 
-                let mut pin_state = 0x00;
-                if tms_val > 0 { pin_state |= 0x08; }
-                if tdi_val > 0 { pin_state |= 0x02; }
+        // Command 0x3B pin layout: Bit 7 = TDI (shifted to MSB), Bit 0 = TMS
+        let pin_state = (tdi_val << 7) | tms_val;
 
-                let tms_state = [0x80u8, pin_state, 0x0B];
-                let _ = self.handle.write_bulk(0x02, &tms_state, Duration::from_millis(10));
+        cmd_buffer.push(0x3B);
+        cmd_buffer.push(0x00);
+        cmd_buffer.push(pin_state);
+        *expected_read_bytes += 1;
+    }
+}
 
-                let mut resp = [0u8; 1];
-                let _ = self.handle.read_bulk(0x81, &mut resp, Duration::from_millis(10));
-                let tdo_val = if (resp[0] & 0x04) > 0 { 1u8 } else { 0u8 };
+fn parse_mpsse_response(bits: u32, read_buffer: &[u8], tdo: &mut [u8]) {
+    for i in 0..bits {
+        let byte_idx = (i / 8) as usize;
+        let bit_idx = (i % 8) as u8;
 
-                tdo[byte_pos] |= tdo_val << b;
-            }
-        }
-        let _ = self.handle.write_bulk(0x02, &[0x87u8], Duration::from_millis(10));
+        // Command 0x3B captures input via Bit 0 (LSB) of the received byte
+        let tdo_bit = read_buffer[i as usize] & 0x01;
+        tdo[byte_idx] |= tdo_bit << bit_idx;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mpsse_payload_batch_generation() {
+        let bits = 2;
+        let tms = [0x01];
+        let tdi = [0x02];
+
+        let mut cmd_buffer = Vec::new();
+        let mut expected_read_bytes = 0;
+
+        generate_mpsse_payload(bits, &tms, &tdi, &mut cmd_buffer, &mut expected_read_bytes);
+
+        assert_eq!(cmd_buffer.len(), 6);
+        assert_eq!(expected_read_bytes, 2);
+
+        assert_eq!(cmd_buffer[0], 0x3B);
+        assert_eq!(cmd_buffer[2], 0x01);
+        assert_eq!(cmd_buffer[3], 0x3B);
+        assert_eq!(cmd_buffer[5], 0x80);
+    }
+
+    #[test]
+    fn test_mpsse_residual_bit_parsing_alignment() {
+        let bits = 2;
+        let mut tdo = [0x00];
+        let mock_read_hardware_buffer = [0x01, 0x00]; // Active bit on LSB (Bit 0)
+
+        parse_mpsse_response(bits, &mock_read_hardware_buffer, &mut tdo);
+        assert_eq!(tdo[0], 0x01);
     }
 }
