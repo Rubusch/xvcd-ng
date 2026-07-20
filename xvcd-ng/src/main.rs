@@ -1,11 +1,12 @@
 use clap::Parser;
 use xvcd_ng::{CliArgs, BackendMode, FtdiMpsseBackend, FtdiBitbangBackend, JtagController, xvc_server::XvcServer};
 
-fn main() -> std::io::Result<()> {
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
     env_logger::init();
     let args = CliArgs::parse();
 
-    let mut hardware: Box<dyn JtagController> = match args.mode {
+    let hardware: Box<dyn JtagController> = match args.mode {
         BackendMode::Mpsse => {
             match FtdiMpsseBackend::new(args.vid, args.pid, args.channel) {
                 Ok(hw) => Box::new(hw),
@@ -26,8 +27,9 @@ fn main() -> std::io::Result<()> {
         }
     };
 
-    let server = XvcServer::new(args.port)?;
+    let server = XvcServer::new(args.port).await?;
     println!("xvcd-ng server initialization complete. Listening on port {}...", args.port);
 
-    server.run(&mut *hardware)
+    let static_hw = Box::leak(hardware);
+    server.run(static_hw).await
 }
