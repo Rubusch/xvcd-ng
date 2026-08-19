@@ -7,6 +7,8 @@ const TDI_PIN: u8  = 0x02; // Output (Bit 1)
 const TDO_PIN: u8  = 0x04; // Input  (Bit 2)
 const TMS_PIN: u8  = 0x08; // Output (Bit 3)
 
+const MAX_BIT_CHUNK_SIZE: u32 = 2048;
+
 pub struct FtdiBitbangBackend {
     _interface_handle: nusb::Interface,
     out_endpoint: nusb::Endpoint<Bulk, Out>,
@@ -24,9 +26,9 @@ impl FtdiBitbangBackend {
             .ok_or_else(|| format!("Could not locate device with VID: {:04x} PID: {:04x}", vid, pid))?;
 
         let device = info.open().await.map_err(|e| format!("Failed opening device handle: {}", e))?;
-        let interface_handle = device.claim_interface(channel_index)
+        let interface_handle = device.detach_and_claim_interface(channel_index)
             .await
-            .map_err(|e| format!("Failed to claim interface {}: {}", channel_index, e))?;
+            .map_err(|e| format!("Failed to detach kernel and claim interface {}: {}", channel_index, e))?;
 
         let out_addr = 0x02 + (channel_index * 2);
         let in_addr = 0x81 + (channel_index * 2);
@@ -82,43 +84,50 @@ impl JtagController for FtdiBitbangBackend {
         for byte in tdo.iter_mut() { *byte = 0x00; }
         if bits == 0 { return Ok(()); }
 
-        // Each bit requires 2 steps (TCK low, TCK high). We batch everything into
-        // a single array buffer to maximize USB high-speed pipeline performance.
-        let num_steps = bits as usize * 2;
-        let mut cmd_buffer = Vec::with_capacity(num_steps);
+        let mut bits_processed = 0u32;
 
-        for i in 0..bits {
-            let byte_idx = (i / 8) as usize;
-            let bit_idx = (i % 8) as u8;
+        while bits_processed < bits {
+            let chunk_bits = std::cmp::min(bits - bits_processed, MAX_BIT_CHUNK_SIZE);
+            let num_steps = chunk_bits as usize * 2;
+            let mut cmd_buffer = Vec::with_capacity(num_steps);
 
-            let tms_val = (tms[byte_idx] >> bit_idx) & 1;
-            let tdi_val = (tdi[byte_idx] >> bit_idx) & 1;
+            for i in 0..chunk_bits {
+                let absolute_bit_idx = bits_processed + i;
+                let byte_idx = (absolute_bit_idx / 8) as usize;
+                let bit_idx = (absolute_bit_idx % 8) as u8;
 
-            let mut pin_base = 0x00;
-            if tms_val > 0 { pin_base |= TMS_PIN; }
-            if tdi_val > 0 { pin_base |= TDI_PIN; }
+                let tms_val = (tms[byte_idx] >> bit_idx) & 1;
+                let tdi_val = (tdi[byte_idx] >> bit_idx) & 1;
 
-            cmd_buffer.push(pin_base);
-            cmd_buffer.push(pin_base | TCK_PIN);
-        }
+                let mut pin_base = 0x00;
+                if tms_val > 0 { pin_base |= TMS_PIN; }
+                if tdi_val > 0 { pin_base |= TDI_PIN; }
 
-        self.out_endpoint.submit(cmd_buffer.into());
-        let tx_completion = self.out_endpoint.next_complete().await;
-        tx_completion.status.map_err(|e| format!("USB TX Transfer Error: {:?}", e))?;
+                cmd_buffer.push(pin_base);
+                cmd_buffer.push(pin_base | TCK_PIN);
+            }
 
-        self.in_endpoint.submit(nusb::transfer::Buffer::new(num_steps));
-        let rx_completion = self.in_endpoint.next_complete().await;
-        rx_completion.status.map_err(|e| format!("USB RX Transfer Error: {:?}", e))?;
+            self.out_endpoint.submit(cmd_buffer.into());
+            let tx_completion = self.out_endpoint.next_complete().await;
+            tx_completion.status.map_err(|e| format!("USB TX Transfer Error: {:?}", e))?;
 
-        for i in 0..bits {
-            let byte_idx = (i / 8) as usize;
-            let bit_idx = (i % 8) as u8;
+            self.in_endpoint.submit(nusb::transfer::Buffer::new(num_steps));
+            let rx_completion = self.in_endpoint.next_complete().await;
+            rx_completion.status.map_err(|e| format!("USB RX Transfer Error: {:?}", e))?;
 
-            let step_offset = (i as usize * 2) + 1;
-            let sampled_pins = rx_completion.buffer[step_offset];
+            for i in 0..chunk_bits {
+                let absolute_bit_idx = bits_processed + i;
+                let byte_idx = (absolute_bit_idx / 8) as usize;
+                let bit_idx = (absolute_bit_idx % 8) as u8;
 
-            let tdo_val = if (sampled_pins & TDO_PIN) > 0 { 1u8 } else { 0u8 };
-            tdo[byte_idx] |= tdo_val << bit_idx;
+                let step_offset = (i as usize * 2) + 1;
+                let sampled_pins = rx_completion.buffer[step_offset];
+
+                let tdo_val = if (sampled_pins & TDO_PIN) > 0 { 1u8 } else { 0u8 };
+                tdo[byte_idx] |= tdo_val << bit_idx;
+            }
+
+            bits_processed += chunk_bits;
         }
 
         Ok(())
