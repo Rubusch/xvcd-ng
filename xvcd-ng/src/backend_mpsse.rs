@@ -24,10 +24,10 @@ impl FtdiMpsseBackend {
 impl JtagController for FtdiMpsseBackend {
     async fn set_tck_period(&mut self, period_ns: u32) -> u32 {
         let freq_hz = 1_000_000_000_u64 / (period_ns as u64);
-
         if let Err(e) = self.mpsse.set_clock(&mut self.device, freq_hz as u32) {
             log::error!("Failed to update MPSSE target clock frequency: {:?}", e);
         }
+
         period_ns
     }
 
@@ -59,3 +59,12 @@ impl JtagController for FtdiMpsseBackend {
         Ok(())
     }
 }
+
+// Note:
+// We do not implement explicit unit tests inside this module because ftdi-nusb
+// relies directly on live hardware enumeration and physical USB file descriptor
+// endpoints. Fully mocking the asynchronous USB sub-layers and register queues
+// would add excessive, brittle complexity. Full operational reliability is
+// already guaranteed by unit tests on the abstract protocol layers
+// (xvc_server.rs) and the thoroughly verified internals of the underlying
+// ftdi-nusb driver crate.

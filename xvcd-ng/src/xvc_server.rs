@@ -5,6 +5,14 @@ use log::{info, error};
 
 pub const XVC_INFO_STRING: &[u8] = b"xvcServer:v1.0\n";
 
+// Note:
+// We explicitly allow 'async_fn_in_trait' and maintain 'async fn' signatures
+// here because our underlying hardware engines (nusb and ftdi-nusb) rely on
+// asynchronous I/O futures. Keeping these traits async ensures proper
+// "tokio-cooperation" — when the server is waiting for USB turnaround
+// microframes, it yields control back to the Tokio executor, preventing
+// thread-stalls and keeping the network socket responsive.
+#[allow(async_fn_in_trait)]
 pub trait JtagController: Send + Sync {
     async fn set_tck_period(&mut self, period_ns: u32) -> u32;
     async fn shift(&mut self, bits: u32, tms: &[u8], tdi: &[u8], tdo: &mut [u8]) -> Result<(), String>;
@@ -87,6 +95,7 @@ impl XvcServer {
 
                 stream.write_all(&tdo_bytes).await?;
                 stream.flush().await?;
+
             } else {
                 error!("Protocol Violation: Unknown stream prefix {:?}", buffer);
                 break;
