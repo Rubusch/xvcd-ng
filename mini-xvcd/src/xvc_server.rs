@@ -50,6 +50,8 @@ impl XvcServer {
         let mut buffer = [0u8; 8];
 
         loop {
+            buffer.fill(0);
+
             if stream.read_exact(&mut buffer).await.is_err() {
                 break;
             }
