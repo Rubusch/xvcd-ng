@@ -45,7 +45,7 @@ mod tests {
         assert_eq!(config.vid, 0x0403);
         assert_eq!(config.pid, 0x6010);
         assert_eq!(config.mode, BackendMode::Bitbang);
-        assert_eq!(config.channel, 0); // Validate default fallback value matches
+        assert_eq!(config.channel, 0);
     }
 
     #[test]
@@ -69,6 +69,26 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_custom_hex_and_port_parsing_long_hex() {
+        let args = CliArgs::try_parse_from([
+            "mini-xvcd",
+            "--port", "3000",
+            "--vid", "0xabcd",
+            "--pid", "0x1234",
+            "--mode", "mpsse",
+            "--channel", "2"
+        ]);
+        assert!(args.is_ok());
+
+        let config = args.unwrap();
+        assert_eq!(config.port, 3000);
+        assert_eq!(config.vid, 0xabcd);
+        assert_eq!(config.pid, 0x1234);
+        assert_eq!(config.mode, BackendMode::Mpsse);
+        assert_eq!(config.channel, 2);
+    }
+
+    #[test]
     fn test_cli_custom_hex_and_port_parsing_short() {
         let args = CliArgs::try_parse_from([
             "mini-xvcd",
@@ -89,8 +109,54 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_hex_parsing_variations() {
+        // Verify both standard raw hex strings and 0x-prefixed variants evaluate identically
+        let args_raw = CliArgs::try_parse_from(["mini-xvcd", "--vid", "0403", "--pid", "6011"]);
+        let args_prefix = CliArgs::try_parse_from(["mini-xvcd", "--vid", "0x0403", "--pid", "0x6011"]);
+
+        assert!(args_raw.is_ok());
+        assert!(args_prefix.is_ok());
+
+        assert_eq!(args_raw.unwrap().vid, 0x0403);
+        assert_eq!(args_prefix.unwrap().vid, 0x0403);
+    }
+
+    #[test]
+    fn test_cli_short_flags_combination() {
+        let args = CliArgs::try_parse_from([
+            "mini-xvcd",
+            "-P", "9000",
+            "-v", "0403",
+            "-p", "6010",
+            "-m", "bitbang",
+            "-c", "1"
+        ]);
+        assert!(args.is_ok());
+
+        let config = args.unwrap();
+        assert_eq!(config.port, 9000);
+        assert_eq!(config.mode, BackendMode::Bitbang);
+        assert_eq!(config.channel, 1);
+    }
+
+    #[test]
     fn test_cli_invalid_hex_rejection() {
-        let args = CliArgs::try_parse_from(["mini-xvcd", "--vid", "invalid_hex_string"]);
+        let args = CliArgs::try_parse_from(["mini-xvcd", "--vid", "not_a_hex_value"]);
+        assert!(args.is_err());
+
+        let err_msg = args.unwrap_err().to_string();
+        assert!(err_msg.contains("Invalid hex numeric value"));
+    }
+
+    #[test]
+    fn test_cli_invalid_port_rejection() {
+        let args = CliArgs::try_parse_from(["mini-xvcd", "--port", "70000"]); // Port value out of u16 range
+        assert!(args.is_err());
+    }
+
+    #[test]
+    fn test_cli_invalid_mode_rejection() {
+        let args = CliArgs::try_parse_from(["mini-xvcd", "--mode", "unknown_mode"]);
         assert!(args.is_err());
     }
 }
