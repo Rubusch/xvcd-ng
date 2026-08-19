@@ -29,7 +29,7 @@ impl XvcServer {
     }
 
     pub async fn run<T: JtagController + 'static>(&self, hardware: &mut T) -> std::io::Result<()> {
-        info!("xvcd-ng async server listening for connections...");
+        info!("mini-xvcd async server listening for connections...");
 
         loop {
             match self.listener.accept().await {

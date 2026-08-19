@@ -1,0 +1,15 @@
+[Unit]
+Description=Xilinx Virtual Cable Async Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mini-xvcd --port 2542 --mode mpsse --channel 0
+Restart=always
+RestartSec=5
+User=pi
+Group=plugdev
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

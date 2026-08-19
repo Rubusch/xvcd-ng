@@ -1,12 +1,12 @@
 use clap::Parser;
-use xvcd_ng::{CliArgs, BackendMode, FtdiMpsseBackend, FtdiBitbangBackend, xvc_server::XvcServer};
+use mini_xvcd::{CliArgs, BackendMode, FtdiMpsseBackend, FtdiBitbangBackend, xvc_server::XvcServer};
 
 enum HardwareBackend {
     Mpsse(FtdiMpsseBackend),
     Bitbang(FtdiBitbangBackend),
 }
 
-impl xvcd_ng::JtagController for HardwareBackend {
+impl mini_xvcd::JtagController for HardwareBackend {
     async fn set_tck_period(&mut self, period_ns: u32) -> u32 {
         match self {
             HardwareBackend::Mpsse(b) => b.set_tck_period(period_ns).await,
@@ -48,7 +48,7 @@ async fn main() -> std::io::Result<()> {
     };
 
     let server = XvcServer::new(args.port).await?;
-    println!("xvcd-ng server initialization complete. Listening on port {}...", args.port);
+    println!("mini-xvcd server initialization complete. Listening on port {}...", args.port);
 
     server.run(&mut hardware).await
 }

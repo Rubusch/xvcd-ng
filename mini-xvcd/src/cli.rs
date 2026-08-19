@@ -7,7 +7,7 @@ pub enum BackendMode {
 }
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "xvcd-ng", version, about = "Xilinx Virtual Cable Daemon in Rust", long_about = None)]
+#[command(name = "mini-xvcd", version, about = "Xilinx Virtual Cable Daemon in Rust", long_about = None)]
 pub struct CliArgs {
     #[arg(short = 'P', long, default_value = "2542")]
     pub port: u16,
@@ -37,7 +37,7 @@ mod tests {
 
     #[test]
     fn test_cli_default_argument_fallback() {
-        let args = CliArgs::try_parse_from(["xvcd-ng"]);
+        let args = CliArgs::try_parse_from(["mini-xvcd"]);
         assert!(args.is_ok());
 
         let config = args.unwrap();
@@ -51,7 +51,7 @@ mod tests {
     #[test]
     fn test_cli_custom_hex_and_port_parsing_long() {
         let args = CliArgs::try_parse_from([
-            "xvcd-ng",
+            "mini-xvcd",
             "--port", "3000",
             "--vid", "0xabcd",
             "--pid", "1234",
@@ -71,7 +71,7 @@ mod tests {
     #[test]
     fn test_cli_custom_hex_and_port_parsing_short() {
         let args = CliArgs::try_parse_from([
-            "xvcd-ng",
+            "mini-xvcd",
             "-P", "3000",
             "-v", "0xabcd",
             "-p", "1234",
@@ -90,7 +90,7 @@ mod tests {
 
     #[test]
     fn test_cli_invalid_hex_rejection() {
-        let args = CliArgs::try_parse_from(["xvcd-ng", "--vid", "invalid_hex_string"]);
+        let args = CliArgs::try_parse_from(["mini-xvcd", "--vid", "invalid_hex_string"]);
         assert!(args.is_err());
     }
 }

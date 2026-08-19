@@ -1,5 +1,5 @@
 [package]
-name = "xvcd-ng"
+name = "mini-xvcd"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,6 +11,3 @@ ftdi-nusb = "0.2.0"
 log = "0.4.33"
 nusb = "0.2.7"
 tokio = { version = "1.53.0", features = ["full"] }
-
-#[target.aarch64-unknown-linux-gnu]
-#image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:edge"

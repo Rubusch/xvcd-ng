@@ -371,6 +371,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "mini-xvcd"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "clap",
+ "env_logger",
+ "ftdi-nusb",
+ "log",
+ "nusb",
+ "tokio",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -753,17 +766,4 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
-]
-
-[[package]]
-name = "xvcd-ng"
-version = "0.1.0"
-dependencies = [
- "byteorder",
- "clap",
- "env_logger",
- "ftdi-nusb",
- "log",
- "nusb",
- "tokio",
 ]
