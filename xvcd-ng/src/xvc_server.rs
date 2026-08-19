@@ -134,7 +134,7 @@ mod tests {
     #[tokio::test]
     async fn test_settck_command() {
         let server = XvcServer { listener: TcpListener::bind("127.0.0.1:0").await.unwrap() };
-        let mut payload = b"settck:\0".to_vec();
+        let mut payload = b"settck:".to_vec();
         payload.write_u32_le(500).await.unwrap();
 
         let mut mock_stream = Cursor::new(payload);
@@ -142,7 +142,11 @@ mod tests {
 
         let _ = server.process_xvc_stream(&mut mock_stream, &mut mock_hw).await;
         let out = mock_stream.into_inner();
-        let returned_period = LittleEndian::read_u32(&out[12..16]);
+
+        let input_tick = LittleEndian::read_u32(&out[7..11]);
+        assert_eq!(input_tick, 500);
+
+        let returned_period = LittleEndian::read_u32(&out[11..15]);
         assert_eq!(returned_period, 1000);
     }
 
@@ -153,7 +157,6 @@ mod tests {
         payload.write_u16_le(0).await.unwrap(); // b2 = 0 (Total = 8 bits -> 1 byte payload)
         payload.push(0xFF); // TMS vector byte (1 byte)
         payload.push(0xAA); // TDI vector byte (1 byte)
-        // Total input wire stream length = 12 bytes
 
         let mut mock_stream = Cursor::new(payload);
         let mut mock_hw = MockJtagBackend { received_bits: 0 };
@@ -162,7 +165,6 @@ mod tests {
         assert_eq!(mock_hw.received_bits, 8);
 
         let out = mock_stream.into_inner();
-        // Since input consumed 12 bytes, the 1-byte TDO hardware result is at index 12
         assert_eq!(out[12], 0x55);
     }
 }
