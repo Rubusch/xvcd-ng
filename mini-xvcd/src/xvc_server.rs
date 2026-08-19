@@ -1,7 +1,7 @@
 use byteorder::{LittleEndian, ByteOrder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use log::{info, error};
+use log::{info, error, debug, trace};
 
 pub const XVC_INFO_STRING: &[u8] = b"xvcServer:v1.0\n";
 
@@ -47,59 +47,82 @@ impl XvcServer {
     }
 
     async fn process_xvc_stream<S: AsyncReadExt + AsyncWriteExt + Unpin, T: JtagController>(&self, mut stream: S, hardware: &mut T) -> std::io::Result<()> {
-        let mut buffer = [0u8; 8];
+        let mut cmd_buf = Vec::with_capacity(32);
 
         loop {
-            buffer.fill(0);
-
-            if stream.read_exact(&mut buffer).await.is_err() {
+            let mut byte = [0u8; 1];
+            if stream.read_exact(&mut byte).await.is_err() {
+                debug!("Client closed connection or stream ended.");
                 break;
             }
+            cmd_buf.push(byte[0]);
 
-            if &buffer[0..8] == b"getinfo:" {
-                stream.write_all(XVC_INFO_STRING).await?;
-                stream.flush().await?;
+            // Match known XVC text command string terminators (like ':')
+            if byte[0] == b':' {
+                let cmd_str = String::from_utf8_lossy(&cmd_buf);
+                trace!("Parsed incoming command token header: {}", cmd_str);
 
-            } else if &buffer[0..7] == b"settck:" {
-                let mut remaining_period = [0u8; 3];
-                stream.read_exact(&mut remaining_period).await?;
+                if cmd_buf == b"getinfo:" {
+                    debug!("Received 'getinfo:' command from host.");
+                    stream.write_all(XVC_INFO_STRING).await?;
+                    stream.flush().await?;
+                    cmd_buf.clear();
 
-                let mut period_buf = [0u8; 4];
-                period_buf[0] = buffer[7];
-                period_buf[1..4].copy_from_slice(&remaining_period);
+                } else if cmd_buf == b"settck:" {
+                    // 'settck:' expects a 4-byte LittleEndian integer directly following it
+                    let mut period_buf = [0u8; 4];
+                    stream.read_exact(&mut period_buf).await?;
+                    
+                    let requested_ns = LittleEndian::read_u32(&period_buf);
+                    debug!("Received 'settck:' command. Requested period: {} ns", requested_ns);
+                    
+                    let configured_ns = hardware.set_tck_period(requested_ns).await;
+                    debug!("Hardware reports configured period: {} ns", configured_ns);
+                    
+                    let mut reply = [0u8; 4];
+                    LittleEndian::write_u32(&mut reply, configured_ns);
+                    stream.write_all(&reply).await?;
+                    stream.flush().await?;
+                    cmd_buf.clear();
 
-                let requested_ns = LittleEndian::read_u32(&period_buf);
-                let configured_ns = hardware.set_tck_period(requested_ns).await;
-                let mut reply = [0u8; 4];
+                } else if cmd_buf == b"shift:" {
+                    // 'shift:' expects a 4-byte LittleEndian integer for number of bits
+                    let mut bits_buf = [0u8; 4];
+                    stream.read_exact(&mut bits_buf).await?;
+                    
+                    let num_bits = LittleEndian::read_u32(&bits_buf);
+                    let byte_len = ((num_bits + 7) / 8) as usize;
+                    
+                    debug!("Received 'shift:' command. Shifting {} bits ({} bytes)", num_bits, byte_len);
 
-                LittleEndian::write_u32(&mut reply, configured_ns);
-                stream.write_all(&reply).await?;
-                stream.flush().await?;
+                    let mut tms_bytes = vec![0u8; byte_len];
+                    let mut tdi_bytes = vec![0u8; byte_len];
+                    let mut tdo_bytes = vec![0u8; byte_len];
 
-            } else if &buffer[0..6] == b"shift:" {
-                let b0 = buffer[6] as u32;
-                let b1 = buffer[7] as u32;
-                let b2 = stream.read_u16_le().await? as u32;
-                let num_bits = b0 | (b1 << 8) | (b2 << 16);
-                let byte_len = ((num_bits + 7) / 8) as usize;
+                    stream.read_exact(&mut tms_bytes).await?;
+                    stream.read_exact(&mut tdi_bytes).await?;
+                    
+                    trace!("Shift data payloads extracted from network stream. Invoking hardware layer...");
 
-                let mut tms_bytes = vec![0u8; byte_len];
-                let mut tdi_bytes = vec![0u8; byte_len];
-                let mut tdo_bytes = vec![0u8; byte_len];
+                    if let Err(e) = hardware.shift(num_bits, &tms_bytes, &tdi_bytes, &mut tdo_bytes).await {
+                        error!("JTAG Hardware shift execution operation error: {}", e);
+                        break;
+                    }
 
-                stream.read_exact(&mut tms_bytes).await?;
-                stream.read_exact(&mut tdi_bytes).await?;
+                    trace!("Hardware shift execution complete. Committing TDO vector back to client.");
+                    stream.write_all(&tdo_bytes).await?;
+                    stream.flush().await?;
+                    cmd_buf.clear();
 
-                if let Err(e) = hardware.shift(num_bits, &tms_bytes, &tdi_bytes, &mut tdo_bytes).await {
-                    error!("JTAG Hardware operation error: {}", e);
+                } else {
+                    error!("Protocol alignment fault. Unknown stream sequence token: {:?}", cmd_str);
                     break;
                 }
+            }
 
-                stream.write_all(&tdo_bytes).await?;
-                stream.flush().await?;
-
-            } else {
-                error!("Protocol Violation: Unknown stream prefix {:?}", buffer);
+            // Safety limit to prevent unbounded memory allocation on corrupt junk streams
+            if cmd_buf.len() > 32 {
+                error!("Protocol Violation: Header length overflow bounds without delimiter.");
                 break;
             }
         }
