@@ -52,77 +52,64 @@ impl XvcServer {
         loop {
             let mut byte = [0u8; 1];
             if stream.read_exact(&mut byte).await.is_err() {
-                debug!("Client closed connection or stream ended.");
+                debug!("Client closed connection or stream ended cleanly.");
                 break;
             }
             cmd_buf.push(byte[0]);
 
-            // Match known XVC text command string terminators (like ':')
-            if byte[0] == b':' {
-                let cmd_str = String::from_utf8_lossy(&cmd_buf);
-                trace!("Parsed incoming command token header: {}", cmd_str);
+            if cmd_buf.starts_with(b"getinfo") {
+                debug!("Received 'getinfo' command from host.");
+                stream.write_all(XVC_INFO_STRING).await?;
+                stream.flush().await?;
+                cmd_buf.clear();
 
-                if cmd_buf == b"getinfo:" {
-                    debug!("Received 'getinfo:' command from host.");
-                    stream.write_all(XVC_INFO_STRING).await?;
-                    stream.flush().await?;
-                    cmd_buf.clear();
+            } else if cmd_buf.starts_with(b"settck") {
+                let mut period_buf = [0u8; 4];
+                stream.read_exact(&mut period_buf).await?;
 
-                } else if cmd_buf == b"settck:" {
-                    // 'settck:' expects a 4-byte LittleEndian integer directly following it
-                    let mut period_buf = [0u8; 4];
-                    stream.read_exact(&mut period_buf).await?;
-                    
-                    let requested_ns = LittleEndian::read_u32(&period_buf);
-                    debug!("Received 'settck:' command. Requested period: {} ns", requested_ns);
-                    
-                    let configured_ns = hardware.set_tck_period(requested_ns).await;
-                    debug!("Hardware reports configured period: {} ns", configured_ns);
-                    
-                    let mut reply = [0u8; 4];
-                    LittleEndian::write_u32(&mut reply, configured_ns);
-                    stream.write_all(&reply).await?;
-                    stream.flush().await?;
-                    cmd_buf.clear();
+                let requested_ns = LittleEndian::read_u32(&period_buf);
+                debug!("Received 'settck' command. Requested period: {} ns", requested_ns);
 
-                } else if cmd_buf == b"shift:" {
-                    // 'shift:' expects a 4-byte LittleEndian integer for number of bits
-                    let mut bits_buf = [0u8; 4];
-                    stream.read_exact(&mut bits_buf).await?;
-                    
-                    let num_bits = LittleEndian::read_u32(&bits_buf);
-                    let byte_len = ((num_bits + 7) / 8) as usize;
-                    
-                    debug!("Received 'shift:' command. Shifting {} bits ({} bytes)", num_bits, byte_len);
+                let configured_ns = hardware.set_tck_period(requested_ns).await;
+                debug!("Hardware configured clock period: {} ns", configured_ns);
 
-                    let mut tms_bytes = vec![0u8; byte_len];
-                    let mut tdi_bytes = vec![0u8; byte_len];
-                    let mut tdo_bytes = vec![0u8; byte_len];
+                let mut reply = [0u8; 4];
+                LittleEndian::write_u32(&mut reply, configured_ns);
+                stream.write_all(&reply).await?;
+                stream.flush().await?;
+                cmd_buf.clear();
 
-                    stream.read_exact(&mut tms_bytes).await?;
-                    stream.read_exact(&mut tdi_bytes).await?;
-                    
-                    trace!("Shift data payloads extracted from network stream. Invoking hardware layer...");
+            } else if cmd_buf.starts_with(b"shift") {
+                let mut bits_buf = [0u8; 4];
+                stream.read_exact(&mut bits_buf).await?;
 
-                    if let Err(e) = hardware.shift(num_bits, &tms_bytes, &tdi_bytes, &mut tdo_bytes).await {
-                        error!("JTAG Hardware shift execution operation error: {}", e);
-                        break;
-                    }
+                let num_bits = LittleEndian::read_u32(&bits_buf);
+                let byte_len = ((num_bits + 7) / 8) as usize;
 
-                    trace!("Hardware shift execution complete. Committing TDO vector back to client.");
-                    stream.write_all(&tdo_bytes).await?;
-                    stream.flush().await?;
-                    cmd_buf.clear();
+                debug!("Received 'shift' command. Shifting {} bits ({} bytes)", num_bits, byte_len);
 
-                } else {
-                    error!("Protocol alignment fault. Unknown stream sequence token: {:?}", cmd_str);
+                let mut tms_bytes = vec![0u8; byte_len];
+                let mut tdi_bytes = vec![0u8; byte_len];
+                let mut tdo_bytes = vec![0u8; byte_len];
+
+                stream.read_exact(&mut tms_bytes).await?;
+                stream.read_exact(&mut tdi_bytes).await?;
+
+                trace!("Invoking JTAG hardware layer transaction flight...");
+
+                if let Err(e) = hardware.shift(num_bits, &tms_bytes, &tdi_bytes, &mut tdo_bytes).await {
+                    error!("JTAG Hardware controller shift execution failure: {}", e);
                     break;
                 }
+
+                trace!("Transaction complete. Flushing TDO sample pool to socket.");
+                stream.write_all(&tdo_bytes).await?;
+                stream.flush().await?;
+                cmd_buf.clear();
             }
 
-            // Safety limit to prevent unbounded memory allocation on corrupt junk streams
-            if cmd_buf.len() > 32 {
-                error!("Protocol Violation: Header length overflow bounds without delimiter.");
+            if cmd_buf.len() > 16 {
+                error!("Protocol alignment fault. Unknown stream lookahead prefix sequence: {:?}", String::from_utf8_lossy(&cmd_buf));
                 break;
             }
         }
@@ -149,17 +136,17 @@ mod tests {
     #[tokio::test]
     async fn test_getinfo_command() {
         let server = XvcServer { listener: TcpListener::bind("127.0.0.1:0").await.unwrap() };
-        let mut mock_stream = Cursor::new(b"getinfo:".to_vec());
+        let mut mock_stream = Cursor::new(b"getinfo".to_vec());
         let mut mock_hw = MockJtagBackend { received_bits: 0 };
 
         let _ = server.process_xvc_stream(&mut mock_stream, &mut mock_hw).await;
-        assert_eq!(&mock_stream.into_inner()[8..], XVC_INFO_STRING);
+        assert_eq!(&mock_stream.into_inner()[7..], XVC_INFO_STRING);
     }
 
     #[tokio::test]
     async fn test_settck_command() {
         let server = XvcServer { listener: TcpListener::bind("127.0.0.1:0").await.unwrap() };
-        let mut payload = b"settck:".to_vec();
+        let mut payload = b"settck".to_vec();
         payload.write_u32_le(500).await.unwrap();
 
         let mut mock_stream = Cursor::new(payload);
@@ -168,18 +155,18 @@ mod tests {
         let _ = server.process_xvc_stream(&mut mock_stream, &mut mock_hw).await;
         let out = mock_stream.into_inner();
 
-        let input_tick = LittleEndian::read_u32(&out[7..11]);
+        let input_tick = LittleEndian::read_u32(&out[6..10]);
         assert_eq!(input_tick, 500);
 
-        let returned_period = LittleEndian::read_u32(&out[11..15]);
+        let returned_period = LittleEndian::read_u32(&out[10..14]);
         assert_eq!(returned_period, 1000);
     }
 
     #[tokio::test]
     async fn test_shift_command() {
         let server = XvcServer { listener: TcpListener::bind("127.0.0.1:0").await.unwrap() };
-        let mut payload = b"shift:\x08\x00".to_vec(); // 8 bits command preamble (b0=8, b1=0)
-        payload.write_u16_le(0).await.unwrap(); // b2 = 0 (Total = 8 bits -> 1 byte payload)
+        let mut payload = b"shift".to_vec();
+        payload.write_u32_le(8).await.unwrap(); // Total = 8 bits -> 1 byte payload data
         payload.push(0xFF); // TMS vector byte (1 byte)
         payload.push(0xAA); // TDI vector byte (1 byte)
 
@@ -190,6 +177,6 @@ mod tests {
         assert_eq!(mock_hw.received_bits, 8);
 
         let out = mock_stream.into_inner();
-        assert_eq!(out[12], 0x55);
+        assert_eq!(out[11], 0x55);
     }
 }
