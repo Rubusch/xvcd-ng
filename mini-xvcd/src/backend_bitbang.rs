@@ -1,13 +1,14 @@
 use crate::xvc_server::JtagController;
-use nusb::transfer::{ControlOut, ControlType, Recipient, Bulk, In, Out};
+use nusb::transfer::{ControlOut, ControlType, Recipient, Bulk, In, Out, Direction};
 use std::time::Duration;
+use log::{trace, warn};
 
 const TCK_PIN: u8  = 0x01; // Output (Bit 0)
 const TDI_PIN: u8  = 0x02; // Output (Bit 1)
 const TDO_PIN: u8  = 0x04; // Input  (Bit 2)
 const TMS_PIN: u8  = 0x08; // Output (Bit 3)
 
-const MAX_BIT_CHUNK_SIZE: u32 = 2048;
+const MAX_BIT_CHUNK_SIZE: u32 = 512;
 
 pub struct FtdiBitbangBackend {
     _interface_handle: nusb::Interface,
@@ -17,11 +18,12 @@ pub struct FtdiBitbangBackend {
 
 impl FtdiBitbangBackend {
     pub async fn new(vid: u16, pid: u16, channel_index: u8) -> Result<Self, String> {
-        let mut devices = nusb::list_devices()
+        let devices = nusb::list_devices()
             .await
             .map_err(|e| format!("Failed listing USB layout: {}", e))?;
 
         let info = devices
+            .into_iter()
             .find(|d| d.vendor_id() == vid && d.product_id() == pid)
             .ok_or_else(|| format!("Could not locate device with VID: {:04x} PID: {:04x}", vid, pid))?;
 
@@ -30,8 +32,22 @@ impl FtdiBitbangBackend {
             .await
             .map_err(|e| format!("Failed to detach kernel and claim interface {}: {}", channel_index, e))?;
 
-        let out_addr = 0x02 + (channel_index * 2);
-        let in_addr = 0x81 + (channel_index * 2);
+        let di = interface_handle.descriptors()
+            .find(|d| d.interface_number() == channel_index)
+            .ok_or_else(|| format!("Could not find descriptor metadata for interface {}", channel_index))?;
+
+        let mut out_addr = None;
+        let mut in_addr = None;
+
+        for ep in di.endpoints() {
+            match ep.direction() {
+                Direction::In => in_addr = Some(ep.address()),
+                Direction::Out => out_addr = Some(ep.address()),
+            }
+        }
+
+        let out_addr = out_addr.ok_or("Could not resolve OUT endpoint address")?;
+        let in_addr = in_addr.ok_or("Could not resolve IN endpoint address")?;
 
         let out_endpoint = interface_handle.endpoint(out_addr)
             .map_err(|e| format!("Failed to open OUT endpoint: {}", e))?;
@@ -47,9 +63,20 @@ impl FtdiBitbangBackend {
             value: 0,
             index: index_routing_value,
             data: &[],
-        }, Duration::from_millis(100))
+        }, Duration::from_millis(50))
         .await
         .map_err(|e| format!("Reset failed: {:?}", e))?;
+
+        interface_handle.control_out(ControlOut {
+            control_type: ControlType::Vendor,
+            recipient: Recipient::Device,
+            request: 0x09, // SET_LATENCY_TIMER
+            value: 2,      // 2ms latency target
+            index: index_routing_value,
+            data: &[],
+        }, Duration::from_millis(50))
+        .await
+        .map_err(|e| format!("Failed to set latency timer: {:?}", e))?;
 
         // Mode 0x01 maps to Asynchronous Bitbang over standard FTDI chips
         // High byte: Mode Selection (0x01) | Low byte: Pin Direction Configuration (Mask)
@@ -63,7 +90,7 @@ impl FtdiBitbangBackend {
             value: bitmode_value,
             index: index_routing_value,
             data: &[],
-        }, Duration::from_millis(100))
+        }, Duration::from_millis(50))
         .await
         .map_err(|e| format!("Failed to set Bitbang Mode: {:?}", e))?;
 
@@ -107,13 +134,29 @@ impl JtagController for FtdiBitbangBackend {
                 cmd_buffer.push(pin_base | TCK_PIN);
             }
 
-            self.out_endpoint.submit(cmd_buffer.into());
-            let tx_completion = self.out_endpoint.next_complete().await;
-            tx_completion.status.map_err(|e| format!("USB TX Transfer Error: {:?}", e))?;
+            let expected_rx_len = num_steps + 2;
 
-            self.in_endpoint.submit(nusb::transfer::Buffer::new(num_steps));
-            let rx_completion = self.in_endpoint.next_complete().await;
-            rx_completion.status.map_err(|e| format!("USB RX Transfer Error: {:?}", e))?;
+            let tx_fut = async {
+                self.out_endpoint.submit(cmd_buffer.into());
+                self.out_endpoint.next_complete().await
+            };
+
+            let rx_fut = async {
+                self.in_endpoint.submit(nusb::transfer::Buffer::new(expected_rx_len));
+                self.in_endpoint.next_complete().await
+            };
+
+            let (tx_res, rx_res) = tokio::join!(tx_fut, rx_fut);
+
+            tx_res.status.map_err(|e| format!("USB TX Execution Error: {:?}", e))?;
+            rx_res.status.map_err(|e| format!("USB RX Execution Error: {:?}", e))?;
+
+            if rx_res.buffer.len() < expected_rx_len {
+                warn!("Short read detected: expected {} bytes, got {}", expected_rx_len, rx_res.buffer.len());
+                return Err("FTDI incomplete chunk capture error during shift sequence.".to_string());
+            }
+
+            let payload = &rx_res.buffer[2..];
 
             for i in 0..chunk_bits {
                 let absolute_bit_idx = bits_processed + i;
@@ -121,7 +164,7 @@ impl JtagController for FtdiBitbangBackend {
                 let bit_idx = (absolute_bit_idx % 8) as u8;
 
                 let step_offset = (i as usize * 2) + 1;
-                let sampled_pins = rx_completion.buffer[step_offset];
+                let sampled_pins = payload[step_offset];
 
                 let tdo_val = if (sampled_pins & TDO_PIN) > 0 { 1u8 } else { 0u8 };
                 tdo[byte_idx] |= tdo_val << bit_idx;
@@ -130,6 +173,7 @@ impl JtagController for FtdiBitbangBackend {
             bits_processed += chunk_bits;
         }
 
+        trace!("Bitbang hardware shift phase complete for {} bits.", bits);
         Ok(())
     }
 }
@@ -164,5 +208,6 @@ mod tests {
         assert_eq!(cmd_buffer[0], 0x08); // Low clock: TMS=1, TDI=0
         assert_eq!(cmd_buffer[1], 0x09); // High clock: TCK | TMS
         assert_eq!(cmd_buffer[2], 0x02); // Low clock: TMS=0, TDI=1
+        assert_eq!(cmd_buffer[3], 0x03);
     }
 }
