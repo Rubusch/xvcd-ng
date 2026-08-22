@@ -13,6 +13,7 @@ impl mini_xvcd::JtagController for HardwareBackend {
             HardwareBackend::Bitbang(b) => b.set_tck_period(period_ns).await,
         }
     }
+
     async fn shift(&mut self, bits: u32, tms: &[u8], tdi: &[u8], tdo: &mut [u8]) -> Result<(), String> {
         match self {
             HardwareBackend::Mpsse(b) => b.shift(bits, tms, tdi, tdo).await,
