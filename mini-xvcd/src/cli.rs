@@ -18,7 +18,7 @@ pub struct CliArgs {
     #[arg(short, long, default_value = "6010", value_parser = parse_hex_u16)]
     pub pid: u16,
 
-    #[arg(short, long, value_enum, default_value_t = BackendMode::Bitbang)]
+    #[arg(short, long, value_enum, default_value_t = BackendMode::Mpsse)]
     pub mode: BackendMode,
 
     /// Hardware channel port selection index (0 = Channel A, 1 = Channel B, etc.)
@@ -44,7 +44,7 @@ mod tests {
         assert_eq!(config.port, 2542);
         assert_eq!(config.vid, 0x0403);
         assert_eq!(config.pid, 0x6010);
-        assert_eq!(config.mode, BackendMode::Bitbang);
+        assert_eq!(config.mode, BackendMode::Mpsse);
         assert_eq!(config.channel, 0);
     }
 

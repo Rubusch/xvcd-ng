@@ -67,7 +67,7 @@ Options:
   -P, --port <PORT>        [default: 2542]
   -v, --vid <VID>          [default: 0403]
   -p, --pid <PID>          [default: 6010]
-  -m, --mode <MODE>        [default: bitbang] [possible values: bitbang, mpsse]
+  -m, --mode <MODE>        [default: mpsse] [possible values: bitbang, mpsse]
   -c, --channel <CHANNEL>  Hardware channel port selection index (0 = Channel A, 1 = Channel B, etc.) [default: 0]
   -h, --help               Print help
   -V, --version            Print version
