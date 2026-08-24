@@ -1,12 +1,14 @@
-# Development Notes
+# Lothar's Mini-XVCD (Xilinx Virtual Cable Daemon)
 
-building for the RPi4
-```
-$ rustup target add aarch64-unknown-linux-gnu
-$ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc cargo build --target aarch64-unknown-linux-gnu --release
-```
+Inspired by the idea of https://github.com/tmbinc/xvcd, this is my mini-xvcd implementation approach. I
+needed this on RPi4 for remote JTAG debugging and access for basic register readouts using XVD over USB
+connected FTDI/JTAG. In contrast to the original xvcd, my implementation supports faster MPSSE (default),
+but also slow bitbanging mode.
 
-- We scaled the command detection buffer down from 16 bytes to 8 bytes because XVC commands are exactly 8 bytes long.
+In particular, XVC (Xilinx Virtual Cable) is based only on `getinfo`, `settck` and `shift`. While the
+hw-server implements the full TCF (Target Communication Framework) as a proprietary binary. While writing
+registers, downloading bitstreams, debugging ILA cores, etc. should work perfectly, limitations are e.g.
+burning eFUSES where Xilinx requires a direct hw-server connection.
 
 ## Hardware Setup
 Hardware Configuration: FT2232H
@@ -14,10 +16,12 @@ Hardware Configuration: FT2232H
 - Product ID (PID): 0x6010 (Standard FT2232C/D/H series)
 - RPi4: controller board for device under test (DUT)
 
-## mini-xvcd
-### Build
+## Build
 Prepare for crosscompiling
 ```
+$ rustup target add aarch64-unknown-linux-gnu
+$ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc cargo build --target aarch64-unknown-linux-gnu --release
+
 $ mkdir .cargo
 $ vi .cargo/config.toml
     [target.aarch64-unknown-linux-gnu]
@@ -29,7 +33,7 @@ Build for RPi4 (aarch64)
 $ cargo build --target aarch64-unknown-linux-gnu --release
 ```
 
-Find the binary here: `./target/aarch64-unknown-linux-gnu/release/mini-xvcd`
+Find the binary: `./target/aarch64-unknown-linux-gnu/release/mini-xvcd`
 
 ## Installation
 Adjust the provided systemd service file and place it under `/etc/systemd/system/mini-xvcd.servic`
@@ -49,11 +53,12 @@ sudo systemctl start xvcd.service
 ## Usage
 Start the mini-xvcd manually to get the most recent help. Find example usage in the systemd service file.
 ### Manual start
-In case unload some modules to avoid being busy locked out.
+In case unload some modules to avoid being busy locked out, anyway the implementation will unload them,
+if in the way.
 ```
-sudo rmmod ftdi_sio
-sudo rmmod usbserial
-sudo ./mini-xvcd
+$ sudo rmmod ftdi_sio
+$ sudo rmmod usbserial
+$ sudo ./mini-xvcd
 ```
 
 see the help
