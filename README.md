@@ -1,5 +1,6 @@
-# Lothar's Mini-XVCD (Xilinx Virtual Cable Daemon)
+[![License: MIT](https://shields.io)](https://opensource.org/licenses/MIT)
 
+# Lothar's Mini-XVCD (Xilinx Virtual Cable Daemon)
 Inspired by the idea of https://github.com/tmbinc/xvcd, this is my mini-xvcd implementation approach. I
 needed this on RPi4 for remote JTAG debugging and access for basic register readouts using XVD over USB
 connected FTDI/JTAG. In contrast to the original xvcd, my implementation supports faster MPSSE (default),
@@ -17,10 +18,18 @@ Hardware Configuration: FT2232H
 - RPi4: controller board for device under test (DUT)
 
 ## Build
-Prepare for crosscompiling
+Prepare for crosscompiling (linux /debian)
+
+Download the C-based toolchain. Note, in principle the source could be compiled with e.g. a pure Rust
+port of musl, since main crates are nusb and ftdi-nusb, but since this is still experimental.
+Therefore at the moment, safest is the following:
+```
+$ sudo apt update && sudo apt install -y gcc-aarch64-linux-gnu
+```
+
+Prepare Rust or verify
 ```
 $ rustup target add aarch64-unknown-linux-gnu
-$ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc cargo build --target aarch64-unknown-linux-gnu --release
 
 $ mkdir .cargo
 $ vi .cargo/config.toml
@@ -77,3 +86,31 @@ Options:
   -h, --help               Print help
   -V, --version            Print version
 ```
+
+## Troubleshooting
+### issue: `DR shift through all zeroes`
+e.g. in xsdb after connecting...
+```
+tcfchan#0
+xsdb% tar
+  1  whole scan chain (DR shift through all zeroes)
+```
+**fix**: Is the device powered?
+
+### issue: `device configuration unstable`
+mini-xvcd started in mode _bitbang_, then
+```
+tcfchan#0
+xsdb% tar
+  1  whole scan chain (device configuration unstable)
+```
+
+**fix**: Use _mpsse_ mode, since it's more stable faster anyway. Unsure, I've seen this from time to time, related to the toolchain / library setup. I could run a version compiled on
+the one rust setup pretty stable and never saw that, where another Rust setup was not able to compile it to get _bitbang_ mode stable. I dumped a `cargo tree` of the working setup
+under ./docs.
+
+### issue: could not get device
+When starting `mini-xvcd`, stops right away with something like could not get device.  
+
+**fix**: Do you pass the correct VID and PID for the device? Is the device around (powered)? Check with `lsusb` what you see, you should see the FTDI along with the `VID:PID` in use, pass
+them according to the CLI args to the program and try again.
